@@ -28,15 +28,18 @@ import io.modelcontextprotocol.kotlin.sdk.types.RPCError
 import io.modelcontextprotocol.kotlin.sdk.types.RPCError.ErrorCode.REQUEST_TIMEOUT
 import io.modelcontextprotocol.kotlin.sdk.types.RequestId
 import io.modelcontextprotocol.kotlin.sdk.types.SUPPORTED_PROTOCOL_VERSIONS
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.job
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.decodeFromJsonElement
 import kotlin.concurrent.atomics.AtomicBoolean
 import kotlin.concurrent.atomics.ExperimentalAtomicApi
+import kotlin.coroutines.cancellation.CancellationException
 import kotlin.time.Duration
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.uuid.ExperimentalUuidApi
@@ -283,17 +286,19 @@ public class StreamableHttpServerTransport(private val configuration: Configurat
     }
 
     override suspend fun close() {
-        streamMutex.withLock {
-            streamsMapping.values.forEach {
-                try {
-                    it.session?.close()
-                } catch (_: Exception) {
+        withContext(NonCancellable) {
+            streamMutex.withLock {
+                streamsMapping.values.forEach {
+                    try {
+                        it.session?.close()
+                    } catch (_: Exception) {
+                    }
                 }
+                streamsMapping.clear()
+                requestToStreamMapping.clear()
+                requestToResponseMapping.clear()
+                invokeOnCloseCallback()
             }
-            streamsMapping.clear()
-            requestToStreamMapping.clear()
-            requestToResponseMapping.clear()
-            invokeOnCloseCallback()
         }
     }
 
@@ -420,6 +425,8 @@ public class StreamableHttpServerTransport(private val configuration: Configurat
             call.coroutineContext.job.invokeOnCompletion { streamsMapping.remove(streamId) }
 
             messages.forEach { message -> _onMessage(message) }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             call.reject(
                 HttpStatusCode.BadRequest,
@@ -498,12 +505,14 @@ public class StreamableHttpServerTransport(private val configuration: Configurat
         val streamId = requestToStreamMapping[requestId] ?: return
         val sessionContext = streamsMapping[streamId] ?: return
 
-        try {
-            sessionContext.session?.close()
-        } catch (e: Exception) {
-            _onError(e)
-        } finally {
-            streamsMapping.remove(streamId)
+        withContext(NonCancellable) {
+            try {
+                sessionContext.session?.close()
+            } catch (e: Exception) {
+                _onError(e)
+            } finally {
+                streamsMapping.remove(streamId)
+            }
         }
     }
 
@@ -554,6 +563,8 @@ public class StreamableHttpServerTransport(private val configuration: Configurat
                         id = eventId,
                         data = McpJson.encodeToString(message),
                     )
+                } catch (e: CancellationException) {
+                    throw e
                 } catch (e: Exception) {
                     _onError(IllegalStateException("Failed to replay event: ${e.message}", e))
                 }
@@ -565,6 +576,8 @@ public class StreamableHttpServerTransport(private val configuration: Configurat
                 streamsMapping.remove(streamId)
                 throwable?.let { _onError(it) }
             }
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             _onError(e)
         }
@@ -658,6 +671,8 @@ public class StreamableHttpServerTransport(private val configuration: Configurat
     private suspend fun flushSse(session: ServerSSESession?) {
         try {
             session?.send(data = "")
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             _onError(e)
         }
@@ -709,6 +724,9 @@ public class StreamableHttpServerTransport(private val configuration: Configurat
         val eventId = configuration.eventStore?.storeEvent(streamId, message)
         try {
             session?.send(event = "message", id = eventId, data = McpJson.encodeToString(message))
+        } catch (e: CancellationException) {
+            streamsMapping.remove(streamId)
+            throw e
         } catch (_: Exception) {
             streamsMapping.remove(streamId)
         }
@@ -733,6 +751,8 @@ public class StreamableHttpServerTransport(private val configuration: Configurat
                 retry = configuration.retryInterval?.inWholeMilliseconds,
                 data = "",
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             _onError(e)
         }
